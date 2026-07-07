@@ -1,0 +1,21 @@
+{
+    "model_path":  "models/package_label_best.pt",
+    "camera_source":  "upload",
+    "confidence":  0.35,
+    "image_size":  416,
+    "min_area":  0.003,
+    "max_aspect":  4.0,
+    "line_y":  0.65,
+    "direction":  "any",
+    "count_mode":  "zone",
+    "tracker_iou":  0.18,
+    "tracker_max_missed":  20,
+    "tracker_max_center_distance":  0.18,
+    "duplicate_distance":  0.12,
+    "duplicate_ttl_seconds":  2.5,
+    "jpeg_quality":  82,
+    "host":  "0.0.0.0",
+    "port":  8000,
+    "device":  "auto",
+    "half":  true
+}

@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: truck-package-counter
+    runtime: docker
+    rootDir: backend
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: CAMERA_SOURCE
+        value: upload
+      - key: DEVICE
+        value: cpu
+      - key: HALF
+        value: false
+      - key: CONF
+        value: 0.35
+      - key: IMGSZ
+        value: 416
+      - key: COUNT_MODE
+        value: zone

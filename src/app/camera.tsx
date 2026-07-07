@@ -1,73 +1,182 @@
-import React, { useState } from 'react';
-import { SafeAreaView, View, Button, StyleSheet, TextInput } from 'react-native';
+import React, { useEffect, useRef, useState } from 'react';
+import { Button, SafeAreaView, ScrollView, StyleSheet, TextInput, View } from 'react-native';
+import { CameraView, useCameraPermissions } from 'expo-camera';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
-import { WebView } from 'react-native-webview';
+
+type Detection = {
+  id?: number;
+  class_name?: string;
+  confidence: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+type Metrics = {
+  count: number;
+  visible: number;
+  fps: number;
+  model?: string;
+  device?: string;
+  detections?: Detection[];
+};
+
+type UploadResponse = {
+  ok: boolean;
+  image?: string;
+  error?: string;
+  metrics?: Metrics;
+};
+
+const DEFAULT_SERVER_URL = 'https://truck-package-counter.onrender.com';
+const CAPTURE_INTERVAL_MS = 350;
 
 export default function CameraPage() {
-  const [mjpegUrl, setMjpegUrl] = useState('http://192.168.1.13:8080/video');
+  const cameraRef = useRef<CameraView | null>(null);
+  const sendingRef = useRef(false);
+  const [permission, requestPermission] = useCameraPermissions();
+  const [serverUrl, setServerUrl] = useState(DEFAULT_SERVER_URL);
   const [active, setActive] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [metrics, setMetrics] = useState<Metrics>({ count: 0, visible: 0, fps: 0, detections: [] });
+  const [status, setStatus] = useState('Start the backend, then press Start analysis.');
 
-  const start = () => {
-    setError(null);
-    if (!mjpegUrl) {
-      setError('Enter a valid MJPEG URL');
+  const cleanServerUrl = serverUrl.replace(/\/+$/, '');
+
+  const uploadFrame = async () => {
+    if (sendingRef.current || !active || !cameraRef.current) return;
+    if (!cleanServerUrl.startsWith('http')) {
+      setStatus('Server URL must start with http:// or https://');
       return;
     }
-    setActive(true);
+
+    sendingRef.current = true;
+    try {
+      const photo = await cameraRef.current.takePictureAsync({
+        base64: true,
+        quality: 0.22,
+        skipProcessing: true,
+        exif: false,
+      });
+      if (!photo?.base64) throw new Error('Camera did not return a frame.');
+
+      const response = await fetch(`${cleanServerUrl}/upload-frame`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image: photo.base64, return_image: false }),
+      });
+      const data = (await response.json()) as UploadResponse;
+      if (!data.ok || !data.metrics) throw new Error(data.error || 'Backend returned no metrics.');
+
+      setMetrics(data.metrics);
+      setStatus(`Connected to ${cleanServerUrl}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatus(`Analysis error: ${message.slice(0, 130)}`);
+    } finally {
+      sendingRef.current = false;
+    }
   };
 
-  const stop = () => setActive(false);
+  useEffect(() => {
+    if (!active) return;
+    const timer = setInterval(uploadFrame, CAPTURE_INTERVAL_MS);
+    uploadFrame();
+    return () => clearInterval(timer);
+  }, [active, cleanServerUrl]);
 
-  const mjpegHtml = (url: string) => `<!doctype html>
-<html>
-<head>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <style>
-    html,body,#stream{height:100%;margin:0;background:#000}
-    #stream img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block}
-  </style>
-</head>
-<body id="stream">
-  <img src="${url}" />
-</body>
-</html>`;
+  const resetCount = async () => {
+    setMetrics((current) => ({ ...current, count: 0, detections: [] }));
+    try {
+      await fetch(`${cleanServerUrl}/reset`, { method: 'POST' });
+      setStatus('Counter reset.');
+    } catch {
+      setStatus('Could not reset server counter.');
+    }
+  };
+
+  if (!permission?.granted) {
+    return (
+      <ThemedView style={styles.container}>
+        <SafeAreaView style={styles.safeArea}>
+          <View style={styles.centerContent}>
+            <ThemedText type="title">Camera permission needed</ThemedText>
+            <ThemedText type="small">Allow camera access so the app can analyze boxes.</ThemedText>
+            <Button title="Allow camera" onPress={requestPermission} />
+          </View>
+        </SafeAreaView>
+      </ThemedView>
+    );
+  }
 
   return (
     <ThemedView style={styles.container}>
       <SafeAreaView style={styles.safeArea}>
-        <ThemedText type="title">MJPEG Stream</ThemedText>
+        <ScrollView contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled">
+          <ThemedText type="title">Phone Camera Counter</ThemedText>
 
-        <View style={styles.panel}>
-          {active ? (
-            <WebView
-                originWhitelist={["*"]}
-                source={{ html: mjpegHtml(mjpegUrl) }}
-                style={{ flex: 1, height: '100%' }}
-                scalesPageToFit
-                mixedContentMode="always"
-                javaScriptEnabled
-                domStorageEnabled
-              />
-          ) : (
-            <View style={{ flex: 1, backgroundColor: '#000' }} />
-          )}
-        </View>
+          <View style={styles.metricsRow}>
+            <View style={styles.metricBox}>
+              <ThemedText type="smallBold" style={styles.metricLabel}>Boxes</ThemedText>
+              <ThemedText type="subtitle" style={styles.metricValue}>{metrics.count ?? 0}</ThemedText>
+            </View>
+            <View style={styles.metricBox}>
+              <ThemedText type="smallBold" style={styles.metricLabel}>Detected</ThemedText>
+              <ThemedText type="subtitle" style={styles.metricValue}>{metrics.visible ?? 0}</ThemedText>
+            </View>
+            <View style={styles.metricBox}>
+              <ThemedText type="smallBold" style={styles.metricLabel}>FPS</ThemedText>
+              <ThemedText type="subtitle" style={styles.metricValue}>{Number(metrics.fps ?? 0).toFixed(1)}</ThemedText>
+            </View>
+          </View>
 
-        <View style={styles.controls}>
-          <TextInput
-            value={mjpegUrl}
-            onChangeText={setMjpegUrl}
-            placeholder="http://PHONE_IP:8080/video"
-            style={styles.input}
-            autoCapitalize="none"
-            keyboardType="url"
-          />
-          <View style={{ height: 8 }} />
-          <Button title={active ? 'Stop stream' : 'Start stream'} onPress={active ? stop : start} />
-          {error && <ThemedText type="small" style={styles.error}>{error}</ThemedText>}
-        </View>
+          <View style={styles.cameraPanel}>
+            <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" animateShutter={false} />
+            <View pointerEvents="none" style={styles.countLine} />
+            {(metrics.detections ?? []).map((detection, index) => (
+              <View
+                key={`${detection.id ?? index}-${detection.x}-${detection.y}`}
+                pointerEvents="none"
+                style={[
+                  styles.box,
+                  {
+                    left: `${detection.x * 100}%`,
+                    top: `${detection.y * 100}%`,
+                    width: `${detection.width * 100}%`,
+                    height: `${detection.height * 100}%`,
+                  },
+                ]}
+              >
+                <ThemedText type="smallBold" style={styles.boxLabel}>
+                  {Math.round((detection.confidence ?? 0) * 100)}%
+                </ThemedText>
+              </View>
+            ))}
+          </View>
+
+          <View style={styles.controls}>
+            <ThemedText type="smallBold">Backend server URL</ThemedText>
+            <TextInput
+              value={serverUrl}
+              onChangeText={setServerUrl}
+              placeholder="https://your-server.onrender.com"
+              style={styles.input}
+              autoCapitalize="none"
+              keyboardType="url"
+            />
+            <View style={styles.buttonRow}>
+              <View style={styles.buttonWrap}>
+                <Button title={active ? 'Stop analysis' : 'Start analysis'} onPress={() => setActive((value) => !value)} />
+              </View>
+              <View style={styles.buttonWrap}>
+                <Button title="Reset count" onPress={resetCount} />
+              </View>
+            </View>
+            <ThemedText type="small">{status}</ThemedText>
+            {metrics.model && <ThemedText type="small">Model: {metrics.model} | Device: {metrics.device ?? 'unknown'}</ThemedText>}
+          </View>
+        </ScrollView>
       </SafeAreaView>
     </ThemedView>
   );
@@ -75,9 +184,53 @@ export default function CameraPage() {
 
 const styles = StyleSheet.create({
   container: { flex: 1 },
-  safeArea: { flex: 1, padding: 16 },
-  panel: { width: '100%', flex: 1, minHeight: 300, backgroundColor: '#000', borderRadius: 8, overflow: 'hidden' },
-  controls: { marginTop: 12 },
-  input: { borderWidth: 1, padding: 8, borderRadius: 6, backgroundColor: '#fff' },
-  error: { marginTop: 8, color: 'red' },
+  safeArea: { flex: 1 },
+  scrollContent: { padding: 16, gap: 12, paddingBottom: 36 },
+  centerContent: { flex: 1, gap: 12, alignItems: 'center', justifyContent: 'center', padding: 24 },
+  metricsRow: { flexDirection: 'row', gap: 8 },
+  metricBox: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: '#d6d6d6',
+    borderRadius: 8,
+    padding: 10,
+    alignItems: 'center',
+    backgroundColor: '#fff',
+  },
+  metricLabel: { color: '#111827', textAlign: 'center' },
+  metricValue: { color: '#111827', textAlign: 'center' },
+  cameraPanel: {
+    width: '100%',
+    aspectRatio: 3 / 4,
+    backgroundColor: '#000',
+    borderRadius: 8,
+    overflow: 'hidden',
+  },
+  countLine: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    top: '65%',
+    height: 3,
+    backgroundColor: '#20d66b',
+  },
+  box: {
+    position: 'absolute',
+    borderWidth: 2,
+    borderColor: '#20d66b',
+    backgroundColor: 'rgba(32, 214, 107, 0.10)',
+  },
+  boxLabel: {
+    position: 'absolute',
+    left: 0,
+    top: 0,
+    color: '#111',
+    backgroundColor: '#20d66b',
+    paddingHorizontal: 4,
+    paddingVertical: 2,
+  },
+  controls: { gap: 8 },
+  input: { borderWidth: 1, borderColor: '#d6d6d6', padding: 10, borderRadius: 8, backgroundColor: '#fff' },
+  buttonRow: { flexDirection: 'row', gap: 10 },
+  buttonWrap: { flex: 1 },
 });
