@@ -32,6 +32,17 @@ type UploadResponse = {
 
 const DEFAULT_SERVER_URL = 'https://truck-package-counter.onrender.com';
 const CAPTURE_INTERVAL_MS = 350;
+const REQUEST_TIMEOUT_MS = 45000;
+
+async function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 export default function CameraPage() {
   const cameraRef = useRef<CameraView | null>(null);
@@ -45,7 +56,11 @@ export default function CameraPage() {
   const cleanServerUrl = serverUrl.replace(/\/+$/, '');
 
   const uploadFrame = async () => {
-    if (sendingRef.current || !active || !cameraRef.current) return;
+    if (sendingRef.current || !active) return;
+    if (!cameraRef.current) {
+      setStatus('Camera is starting. Keep the app open for a moment...');
+      return;
+    }
     if (!cleanServerUrl.startsWith('http')) {
       setStatus('Server URL must start with http:// or https://');
       return;
@@ -61,11 +76,12 @@ export default function CameraPage() {
       });
       if (!photo?.base64) throw new Error('Camera did not return a frame.');
 
-      const response = await fetch(`${cleanServerUrl}/upload-frame`, {
+      const response = await fetchWithTimeout(`${cleanServerUrl}/upload-frame`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ image: photo.base64, return_image: false }),
       });
+      if (!response.ok) throw new Error(`Server returned HTTP ${response.status}`);
       const data = (await response.json()) as UploadResponse;
       if (!data.ok || !data.metrics) throw new Error(data.error || 'Backend returned no metrics.');
 
@@ -73,7 +89,7 @@ export default function CameraPage() {
       setStatus(`Connected to ${cleanServerUrl}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      setStatus(`Analysis error: ${message.slice(0, 130)}`);
+      setStatus(`Analysis error: ${message.slice(0, 180)}`);
     } finally {
       sendingRef.current = false;
     }
@@ -89,11 +105,44 @@ export default function CameraPage() {
   const resetCount = async () => {
     setMetrics((current) => ({ ...current, count: 0, detections: [] }));
     try {
-      await fetch(`${cleanServerUrl}/reset`, { method: 'POST' });
+      await fetchWithTimeout(`${cleanServerUrl}/reset`, { method: 'POST' }, 15000);
       setStatus('Counter reset.');
     } catch {
       setStatus('Could not reset server counter.');
     }
+  };
+
+  const testServer = async () => {
+    if (!cleanServerUrl.startsWith('http')) {
+      setStatus('Server URL must start with http:// or https://');
+      return false;
+    }
+    setStatus('Testing server connection...');
+    try {
+      const response = await fetchWithTimeout(`${cleanServerUrl}/health`, {}, 60000);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      if (!data.ok) throw new Error('Server health check did not return ok=true.');
+      setStatus(`Server online. Model: ${data.model ?? 'unknown'} | Device: ${data.device ?? 'unknown'}`);
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatus(`Server test failed: ${message.slice(0, 180)}`);
+      return false;
+    }
+  };
+
+  const toggleAnalysis = async () => {
+    if (active) {
+      setActive(false);
+      setStatus('Analysis stopped.');
+      return;
+    }
+    setStatus('Starting analysis. Waking server if needed...');
+    const ok = await testServer();
+    if (!ok) return;
+    setActive(true);
+    setStatus('Server online. Starting camera analysis...');
   };
 
   if (!permission?.granted) {
@@ -167,13 +216,14 @@ export default function CameraPage() {
             />
             <View style={styles.buttonRow}>
               <View style={styles.buttonWrap}>
-                <Button title={active ? 'Stop analysis' : 'Start analysis'} onPress={() => setActive((value) => !value)} />
+                <Button title={active ? 'Stop analysis' : 'Start analysis'} onPress={toggleAnalysis} />
               </View>
               <View style={styles.buttonWrap}>
                 <Button title="Reset count" onPress={resetCount} />
               </View>
             </View>
-            <ThemedText type="small">{status}</ThemedText>
+            <Button title="Test server" onPress={testServer} />
+            <ThemedText type="small" style={styles.statusText}>{status}</ThemedText>
             {metrics.model && <ThemedText type="small">Model: {metrics.model} | Device: {metrics.device ?? 'unknown'}</ThemedText>}
           </View>
         </ScrollView>
@@ -233,4 +283,5 @@ const styles = StyleSheet.create({
   input: { borderWidth: 1, borderColor: '#d6d6d6', padding: 10, borderRadius: 8, backgroundColor: '#fff' },
   buttonRow: { flexDirection: 'row', gap: 10 },
   buttonWrap: { flex: 1 },
+  statusText: { color: '#fff' },
 });
