@@ -17,6 +17,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from ultralytics import YOLO
 
+torch.set_num_threads(max(1, int(os.getenv("TORCH_NUM_THREADS", "1"))))
+
 try:
     from aiortc import RTCPeerConnection, RTCSessionDescription
 except Exception:
@@ -247,6 +249,7 @@ def load_settings(base_dir: Path) -> dict:
         "tracker_max_center_distance": 0.18,
         "duplicate_distance": 0.12,
         "duplicate_ttl_seconds": 2.5,
+        "max_upload_width": 640,
         "jpeg_quality": 82,
         "host": "0.0.0.0",
         "port": 8000,
@@ -286,6 +289,7 @@ class BoxCounterService:
         self.tracker_max_center_distance = setting_value(self.settings, "tracker_max_center_distance", "TRACKER_MAX_CENTER_DISTANCE", float)
         self.duplicate_distance = setting_value(self.settings, "duplicate_distance", "DUPLICATE_DISTANCE", float)
         self.duplicate_ttl_seconds = setting_value(self.settings, "duplicate_ttl_seconds", "DUPLICATE_TTL_SECONDS", float)
+        self.max_upload_width = setting_value(self.settings, "max_upload_width", "MAX_UPLOAD_WIDTH", int)
         self.jpeg_quality = setting_value(self.settings, "jpeg_quality", "JPEG_QUALITY", int)
         self.device = self._resolve_device(str(os.getenv("DEVICE", self.settings.get("device", "auto"))))
         self.half = setting_value(self.settings, "half", "HALF", lambda value: str(value).lower() in {"1", "true", "yes", "on"})
@@ -348,12 +352,14 @@ class BoxCounterService:
         source = int(self.source) if str(self.source).isdigit() else self.source
         return cv2.VideoCapture(source)
 
-    def _detect(self, frame) -> List[Detection]:
+    def _detect(self, frame) -> Tuple[List[Detection], float]:
+        start = time.perf_counter()
         results = self.model.predict(frame, conf=self.conf, imgsz=self.imgsz, device=self.device, half=self.half and self.device != "cpu", verbose=False)
+        infer_ms = (time.perf_counter() - start) * 1000.0
         boxes = results[0].boxes
         detections: List[Detection] = []
         if boxes is None:
-            return detections
+            return detections, infer_ms
         frame_area = frame.shape[0] * frame.shape[1]
         for box in boxes:
             cls_id = int(box.cls[0])
@@ -370,7 +376,7 @@ class BoxCounterService:
             if det.aspect > self.max_aspect:
                 continue
             detections.append(det)
-        return detections
+        return detections, infer_ms
 
     def _draw(self, frame, detections: List[Detection], fps: float, count: int) -> None:
         for det in detections:
@@ -385,15 +391,19 @@ class BoxCounterService:
         cv2.putText(frame, f"Visible packages: {len(detections)}", (20, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
         cv2.putText(frame, f"FPS: {fps:.1f}", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
 
-    def _process_frame(self, frame, fps: Optional[float] = None) -> Tuple[bytes, dict]:
-        detections = self.tracker.update(self._detect(frame), frame.shape)
+    def _process_frame(self, frame, fps: Optional[float] = None, return_image: bool = True) -> Tuple[Optional[bytes], dict]:
+        process_start = time.perf_counter()
+        detections, infer_ms = self._detect(frame)
+        detections = self.tracker.update(detections, frame.shape)
         count = self.counter.update(detections, frame.shape)
         display_fps = fps if fps is not None else float(self.metrics.get("fps", 0.0))
-        self._draw(frame, detections, display_fps, count)
-        ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
-        if not ok:
-            raise RuntimeError("Could not encode frame")
-        payload = encoded.tobytes()
+        payload = None
+        if return_image:
+            self._draw(frame, detections, display_fps, count)
+            ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+            if not ok:
+                raise RuntimeError("Could not encode frame")
+            payload = encoded.tobytes()
         detection_payload = []
         h, w = frame.shape[:2]
         for det in detections:
@@ -419,20 +429,26 @@ class BoxCounterService:
             "count_mode": self.count_mode,
             "device": str(self.device),
             "torch_cuda": torch.cuda.is_available(),
+            "frame_width": w,
+            "frame_height": h,
+            "infer_ms": round(infer_ms, 1),
+            "process_ms": round((time.perf_counter() - process_start) * 1000.0, 1),
             "detections": detection_payload,
         }
         with self.lock:
-            self.latest_jpeg = payload
+            if payload is not None:
+                self.latest_jpeg = payload
             self.metrics = metrics
         return payload, metrics
 
-    def process_uploaded_frame(self, image_b64: str) -> Tuple[bytes, dict]:
+    def process_uploaded_frame(self, image_b64: str, return_image: bool = True) -> Tuple[Optional[bytes], dict]:
         if image_b64.startswith("data:image"):
             image_b64 = image_b64.split(",", 1)[1]
         raw = base64.b64decode(image_b64)
         frame = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
             raise ValueError("Invalid image")
+        frame = self._resize_for_upload(frame)
         now = time.time()
         if self.last_upload_time is None:
             fps = 0.0
@@ -442,7 +458,16 @@ class BoxCounterService:
             fps = 0.85 * self.upload_fps + 0.15 * instant if self.upload_fps else instant
         self.last_upload_time = now
         self.upload_fps = fps
-        return self._process_frame(frame, fps)
+        return self._process_frame(frame, fps, return_image=return_image)
+
+    def _resize_for_upload(self, frame):
+        if self.max_upload_width <= 0:
+            return frame
+        h, w = frame.shape[:2]
+        if w <= self.max_upload_width:
+            return frame
+        scale = self.max_upload_width / float(w)
+        return cv2.resize(frame, (self.max_upload_width, max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
 
 
     def process_webrtc_frame(self, frame) -> Tuple[bytes, dict]:
@@ -552,9 +577,9 @@ async def upload_frame(request: Request):
         return_image = bool(payload.get("return_image", True))
         if not image_b64:
             return {"ok": False, "error": "Missing image"}
-        frame, metrics = service.process_uploaded_frame(image_b64)
+        frame, metrics = service.process_uploaded_frame(image_b64, return_image=return_image)
         response = {"ok": True, "metrics": metrics}
-        if return_image:
+        if return_image and frame is not None:
             response["image"] = base64.b64encode(frame).decode("ascii")
         return response
     except Exception as exc:

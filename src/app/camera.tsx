@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Button, SafeAreaView, ScrollView, StyleSheet, TextInput, View } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
+import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 
@@ -20,6 +21,8 @@ type Metrics = {
   fps: number;
   model?: string;
   device?: string;
+  infer_ms?: number;
+  process_ms?: number;
   detections?: Detection[];
 };
 
@@ -31,8 +34,9 @@ type UploadResponse = {
 };
 
 const DEFAULT_SERVER_URL = 'https://truck-package-counter.onrender.com';
-const CAPTURE_INTERVAL_MS = 350;
+const CAPTURE_INTERVAL_MS = 650;
 const REQUEST_TIMEOUT_MS = 45000;
+const UPLOAD_WIDTH = 640;
 
 async function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
   const controller = new AbortController();
@@ -69,24 +73,31 @@ export default function CameraPage() {
     sendingRef.current = true;
     try {
       const photo = await cameraRef.current.takePictureAsync({
-        base64: true,
-        quality: 0.22,
+        base64: false,
+        quality: 0.25,
         skipProcessing: true,
         exif: false,
       });
-      if (!photo?.base64) throw new Error('Camera did not return a frame.');
+      if (!photo?.uri) throw new Error('Camera did not return a frame.');
+
+      const resized = await manipulateAsync(
+        photo.uri,
+        [{ resize: { width: UPLOAD_WIDTH } }],
+        { base64: true, compress: 0.28, format: SaveFormat.JPEG }
+      );
+      if (!resized.base64) throw new Error('Could not prepare frame for upload.');
 
       const response = await fetchWithTimeout(`${cleanServerUrl}/upload-frame`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ image: photo.base64, return_image: false }),
+        body: JSON.stringify({ image: resized.base64, return_image: false }),
       });
       if (!response.ok) throw new Error(`Server returned HTTP ${response.status}`);
       const data = (await response.json()) as UploadResponse;
       if (!data.ok || !data.metrics) throw new Error(data.error || 'Backend returned no metrics.');
 
       setMetrics(data.metrics);
-      setStatus(`Connected to ${cleanServerUrl}`);
+      setStatus(`Connected | inference ${data.metrics.infer_ms ?? '?'} ms | total ${data.metrics.process_ms ?? '?'} ms`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setStatus(`Analysis error: ${message.slice(0, 180)}`);

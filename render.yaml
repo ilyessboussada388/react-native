@@ -16,6 +16,10 @@ services:
       - key: CONF
         value: 0.35
       - key: IMGSZ
-        value: 416
+        value: 320
       - key: COUNT_MODE
         value: zone
+      - key: MAX_UPLOAD_WIDTH
+        value: 640
+      - key: TORCH_NUM_THREADS
+        value: 1
