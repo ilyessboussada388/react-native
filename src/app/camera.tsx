@@ -35,7 +35,7 @@ type UploadResponse = {
 
 const DEFAULT_SERVER_URL = 'https://truck-package-counter.onrender.com';
 const CAPTURE_INTERVAL_MS = 650;
-const REQUEST_TIMEOUT_MS = 45000;
+const REQUEST_TIMEOUT_MS = 90000;
 const UPLOAD_WIDTH = 640;
 
 async function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
@@ -77,6 +77,7 @@ export default function CameraPage() {
         quality: 0.25,
         skipProcessing: true,
         exif: false,
+        shutterSound: false,
       });
       if (!photo?.uri) throw new Error('Camera did not return a frame.');
 
@@ -92,7 +93,13 @@ export default function CameraPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ image: resized.base64, return_image: false }),
       });
-      if (!response.ok) throw new Error(`Server returned HTTP ${response.status}`);
+      if (!response.ok) {
+        throw new Error(
+          response.status === 502
+            ? 'Render returned HTTP 502. The server is sleeping, starting, or crashed. Wait 30 seconds and press Start again.'
+            : `Server returned HTTP ${response.status}`
+        );
+      }
       const data = (await response.json()) as UploadResponse;
       if (!data.ok || !data.metrics) throw new Error(data.error || 'Backend returned no metrics.');
 
@@ -130,11 +137,17 @@ export default function CameraPage() {
     }
     setStatus('Testing server connection...');
     try {
-      const response = await fetchWithTimeout(`${cleanServerUrl}/health`, {}, 60000);
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const response = await fetchWithTimeout(`${cleanServerUrl}/warmup`, {}, 90000);
+      if (!response.ok) {
+        throw new Error(
+          response.status === 502
+            ? 'Render returned HTTP 502 during warmup. Check the Render logs; the backend is probably crashing.'
+            : `HTTP ${response.status}`
+        );
+      }
       const data = await response.json();
       if (!data.ok) throw new Error('Server health check did not return ok=true.');
-      setStatus(`Server online. Model: ${data.model ?? 'unknown'} | Device: ${data.device ?? 'unknown'}`);
+      setStatus(`Server ready. Model: ${data.model ?? 'unknown'} | warmup ${data.seconds ?? 0}s | Device: ${data.device ?? 'unknown'}`);
       return true;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -192,7 +205,7 @@ export default function CameraPage() {
           </View>
 
           <View style={styles.cameraPanel}>
-            <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" animateShutter={false} />
+            <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" animateShutter={false} mute />
             <View pointerEvents="none" style={styles.countLine} />
             {(metrics.detections ?? []).map((detection, index) => (
               <View

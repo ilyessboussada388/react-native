@@ -294,10 +294,10 @@ class BoxCounterService:
         self.device = self._resolve_device(str(os.getenv("DEVICE", self.settings.get("device", "auto"))))
         self.half = setting_value(self.settings, "half", "HALF", lambda value: str(value).lower() in {"1", "true", "yes", "on"})
 
-        self.model = YOLO(str(self.model_path))
         print(f"[counter] model={self.model_path}")
         print(f"[counter] device={self.device}, torch_cuda={torch.cuda.is_available()}")
-        self.names = self.model.names
+        self.model = None
+        self.names = {}
         self.tracker = SimpleIOUTracker(
             iou_threshold=self.tracker_iou,
             max_missed=self.tracker_max_missed,
@@ -319,6 +319,18 @@ class BoxCounterService:
         self.last_upload_time: Optional[float] = None
         self.webrtc_fps = 0.0
         self.last_webrtc_time: Optional[float] = None
+
+    def _ensure_model(self) -> None:
+        if self.model is not None:
+            return
+        with self.lock:
+            if self.model is not None:
+                return
+            start = time.perf_counter()
+            print(f"[counter] loading YOLO model: {self.model_path}")
+            self.model = YOLO(str(self.model_path))
+            self.names = self.model.names
+            print(f"[counter] model loaded in {(time.perf_counter() - start):.1f}s")
 
     def start(self) -> None:
         if self.source.lower() == "upload":
@@ -353,6 +365,7 @@ class BoxCounterService:
         return cv2.VideoCapture(source)
 
     def _detect(self, frame) -> Tuple[List[Detection], float]:
+        self._ensure_model()
         start = time.perf_counter()
         results = self.model.predict(frame, conf=self.conf, imgsz=self.imgsz, device=self.device, half=self.half and self.device != "cpu", verbose=False)
         infer_ms = (time.perf_counter() - start) * 1000.0
@@ -695,12 +708,19 @@ def settings():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "model": service.model_path.name, "device": str(service.device)}
+    return {"ok": True, "model": service.model_path.name, "model_loaded": service.model is not None, "device": str(service.device)}
+
+
+@app.get("/warmup")
+def warmup():
+    start = time.perf_counter()
+    service._ensure_model()
+    return {"ok": True, "model": service.model_path.name, "model_loaded": True, "seconds": round(time.perf_counter() - start, 2), "device": str(service.device)}
 
 
 @app.get("/")
 def root():
-    return {"webrtc_offer": "/webrtc/offer", "upload_frame": "/upload-frame", "mobile": "/mobile", "video": "/video", "snapshot": "/snapshot", "metrics": "/metrics", "settings": "/settings", "reset": "/reset"}
+    return {"webrtc_offer": "/webrtc/offer", "upload_frame": "/upload-frame", "mobile": "/mobile", "video": "/video", "snapshot": "/snapshot", "metrics": "/metrics", "settings": "/settings", "reset": "/reset", "warmup": "/warmup"}
 
 
 if __name__ == "__main__":
